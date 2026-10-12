@@ -5,6 +5,8 @@ import android.app.AlertDialog
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -39,7 +41,19 @@ class MainActivity : ComponentActivity() {
     private var currentSessionId: Long? = null
     private var pendingLocationAction: String? = null
     private var screen: LinearLayout? = null
+    private var currentScrollView: ScrollView? = null
     private var actionInProgress = false
+    private var selectedTab = TAB_CURRENT
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val refreshRunnable = object : Runnable {
+        override fun run() {
+            if (activityVisible && selectedTab == TAB_CURRENT && !actionInProgress) {
+                lifecycleScope.launch { refreshScreen() }
+            }
+            if (activityVisible) mainHandler.postDelayed(this, UI_REFRESH_INTERVAL_MS)
+        }
+    }
+    private var activityVisible = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,15 +71,24 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        lifecycleScope.launch { refreshScreen() }
     }
 
     override fun onResume() {
         super.onResume()
+        activityVisible = true
         lifecycleScope.launch { refreshScreen() }
+        mainHandler.removeCallbacks(refreshRunnable)
+        mainHandler.postDelayed(refreshRunnable, UI_REFRESH_INTERVAL_MS)
+    }
+
+    override fun onPause() {
+        activityVisible = false
+        mainHandler.removeCallbacks(refreshRunnable)
+        super.onPause()
     }
 
     private suspend fun refreshScreen() {
+        val previousScrollY = currentScrollView?.scrollY ?: 0
         val dao = db.taxiDao()
         val activeSession = dao.getActiveSession()
         val displaySession = activeSession ?: dao.getLatestSession()
@@ -73,6 +96,18 @@ class MainActivity : ComponentActivity() {
         val fare = dao.getActiveFareConfig()
         val allTrips = displaySession?.let { dao.getTripsForSession(it.id) }.orEmpty()
         val activeTrips = allTrips.filter { it.status == "ACTIVE" }
+        val latestPoint = displaySession?.let { dao.getLatestLocationPoint(it.id) }
+        val latestValidPoint = displaySession?.let { dao.getLatestValidLocationPoint(it.id) }
+        val now = System.currentTimeMillis()
+        val gpsFresh = latestValidPoint != null && now >= latestValidPoint.recordedAtMs &&
+            now - latestValidPoint.recordedAtMs <= GPS_FRESHNESS_MS
+        val gpsStatus = when {
+            activeSession == null -> "GPS: شیفت فعال نیست"
+            latestPoint == null -> "GPS: هنوز نقطه‌ای ثبت نشده"
+            !gpsFresh -> "GPS: موقعیت تازه نداریم؛ مسیر را بررسی کنید"
+            latestPoint.validity != "VALID" -> "GPS: آخرین نقطه نامعتبر است"
+            else -> "GPS: فعال · دقت آخرین نقطه ${latestValidPoint?.accuracyMeters?.let { "%.0f متر".format(Locale.US, it) } ?: "نامشخص"}"
+        }
 
         val scroll = ScrollView(this).apply {
             layoutDirection = View.LAYOUT_DIRECTION_RTL
@@ -81,89 +116,174 @@ class MainActivity : ComponentActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(16), dp(12), dp(16), dp(24))
-            setBackgroundColor(0xFFF5F6F8.toInt())
+            setPadding(dp(12), dp(10), dp(12), dp(24))
+            setBackgroundColor(0xFFF2F4F7.toInt())
         }
         scroll.addView(root)
         screen = root
 
-        root.addView(text("تاکسی‌متر گردشی", 25f, true).apply { setPadding(0, 0, 0, dp(4)) })
-        root.addView(text("مدیریت مستقل سفرهای حداکثر چهار مسافر", 14f, false, 0xFF5F6368.toInt()))
-        root.addView(spacer(12))
+        root.addView(text("تاکسی‌متر گردشی", 24f, true).apply { setPadding(0, 0, 0, dp(3)) })
+        root.addView(text("مدیریت مستقل سفرهای حداکثر چهار مسافر", 13f, false, 0xFF5F6368.toInt()))
+        root.addView(spacer(8))
 
         val shiftStatus = when {
-            activeSession != null -> "وضعیت شیفت: فعال · شناسه ${activeSession.id}"
-            displaySession != null -> "وضعیت شیفت: آخرین شیفت بسته‌شده · شناسه ${displaySession.id}"
-            else -> "وضعیت شیفت: شروع نشده"
+            activeSession != null -> "شیفت فعال · شناسه ${activeSession.id}"
+            displaySession != null -> "آخرین شیفت بسته‌شده · شناسه ${displaySession.id}"
+            else -> "شیفت شروع نشده"
         }
         root.addView(card().apply {
-            addView(text(shiftStatus, 16f, true))
-            addView(text("تعرفه فعال: ${fare?.let { "نسخه ${it.version} · هر کیلومتر ${money(it.ratePerKmToman)} · حداقل ${money(it.minimumFareToman)}" } ?: "تعریف نشده"}", 13f, false))
-            addView(text("کرایه پیش‌فرض فقط بر اساس مسافت معتبر است؛ زمان توقف به کرایه اضافه نمی‌شود.", 12f, false, 0xFF5F6368.toInt()))
+            addView(text(shiftStatus, 15f, true))
+            addView(text(gpsStatus, 13f, true, if (gpsFresh) 0xFF287D46.toInt() else 0xFF9A5B00.toInt()))
+            addView(text("تعرفه فعال: ${fare?.let { "نسخه ${it.version} · هر کیلومتر ${money(it.ratePerKmToman)} · حداقل ${money(it.minimumFareToman)}" } ?: "تعریف نشده"}", 12f, false))
+            addView(text("توقف به کرایه اضافه نمی‌شود. کرایه‌های روی کارت‌ها تخمینی‌اند؛ مبلغ قطعی فقط پس از اعتبارسنجی مسیر تعیین می‌شود.", 11f, false, 0xFF5F6368.toInt()))
         })
-
-        val primaryActions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        if (activeSession == null) {
-            primaryActions.addView(actionButton("شروع شیفت و ثبت GPS") { beginStartShiftFlow(fare) })
-        } else {
-            primaryActions.addView(actionButton("فعال‌سازی / ادامه ثبت GPS") { requestLocationAction(ACTION_RESUME_GPS) })
-            primaryActions.addView(actionButton("پایان شیفت") { confirmCloseShift(activeSession.id, activeTrips.size) })
-        }
-        primaryActions.addView(actionButton("تعریف / تغییر تعرفه (برای سفرهای جدید)") { showFareConfigDialog(fare) })
-        root.addView(primaryActions)
         root.addView(spacer(8))
-        root.addView(text("وضعیت صندلی‌ها", 20f, true))
-        root.addView(text("هر صندلی فقط یک سفر فعال دارد؛ با پیاده‌شدن، فقط همان سفر بسته می‌شود.", 13f, false, 0xFF5F6368.toInt()))
-        root.addView(spacer(4))
 
-        for (seat in 1..4) {
-            val trip = activeTrips.firstOrNull { it.seatNumber == seat }
-            val seatCard = card()
-            seatCard.addView(text("صندلی $seat", 18f, true))
-            if (trip == null) {
-                seatCard.addView(text("آزاد", 15f, false, 0xFF287D46.toInt()))
-                seatCard.addView(actionButton("سوار کردن مسافر") {
-                    if (currentSessionId == null) toast("ابتدا شیفت را شروع کنید.")
-                    else confirmBoardPassenger(currentSessionId!!, seat)
-                }.apply { isEnabled = activeSession != null && !actionInProgress })
+        val tabs = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        val currentTabButton = actionButton("سفر جاری") { selectedTab = TAB_CURRENT; lifecycleScope.launch { refreshScreen() } }
+        val managementTabButton = actionButton("مدیریت شیفت و تعرفه") { selectedTab = TAB_MANAGEMENT; lifecycleScope.launch { refreshScreen() } }
+        currentTabButton.layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(4) }
+        managementTabButton.layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(4) }
+        currentTabButton.alpha = if (selectedTab == TAB_CURRENT) 1f else 0.65f
+        managementTabButton.alpha = if (selectedTab == TAB_MANAGEMENT) 1f else 0.65f
+        tabs.addView(currentTabButton)
+        tabs.addView(managementTabButton)
+        root.addView(tabs)
+        root.addView(spacer(8))
+
+        if (selectedTab == TAB_MANAGEMENT) {
+            root.addView(text("مدیریت شیفت", 19f, true))
+            root.addView(spacer(4))
+            if (activeSession == null) {
+                root.addView(actionButton("شروع شیفت و ثبت GPS") { beginStartShiftFlow(fare) })
             } else {
-                val distance = dao.getAllocatedDistanceMeters(trip.id)
-                val stateText = if (trip.reviewStatus == "REQUIRED" || trip.hasUnresolvedGap) "نیازمند بررسی GPS" else "سفر فعال"
-                seatCard.addView(text(stateText, 14f, true, if (trip.reviewStatus == "REQUIRED" || trip.hasUnresolvedGap) 0xFF9A5B00.toInt() else 0xFF2256A0.toInt()))
-                seatCard.addView(text("شناسه: ${trip.id.take(8)}…", 12f, false, 0xFF5F6368.toInt()))
-                seatCard.addView(text("مسافت معتبر ثبت‌شده: ${distance} متر", 14f, false))
-                seatCard.addView(text("کرایه نهایی هنگام پیاده‌شدن و پس از اعتبارسنجی تعیین می‌شود.", 12f, false, 0xFF5F6368.toInt()))
-                seatCard.addView(actionButton("ثبت پیاده‌شدن") { confirmAlightPassenger(trip) }.apply { isEnabled = !actionInProgress })
+                root.addView(actionButton("فعال‌سازی / ادامه ثبت GPS") { requestLocationAction(ACTION_RESUME_GPS) })
+                root.addView(actionButton("پایان شیفت") { confirmCloseShift(activeSession.id, activeTrips.size) })
+                if (activeTrips.isNotEmpty()) {
+                    root.addView(text("برای پایان شیفت، ابتدا ${activeTrips.size} سفر فعال را ببندید.", 13f, true, 0xFF9A5B00.toInt()))
+                }
             }
-            root.addView(seatCard)
-            root.addView(spacer(8))
-        }
-
-        root.addView(text("سفرهای اخیر", 20f, true))
-        val recentTrips = allTrips.sortedByDescending { it.boardedAtMs }.take(10)
-        if (recentTrips.isEmpty()) {
-            root.addView(text("هنوز سفری در این شیفت ثبت نشده است.", 13f, false, 0xFF5F6368.toInt()))
+            root.addView(spacer(10))
+            root.addView(text("تعرفه", 19f, true))
+            root.addView(text("هر تغییر، نسخه جدیدی از تعرفه می‌سازد و فقط برای سفرهای بعدی استفاده می‌شود.", 13f, false, 0xFF5F6368.toInt()))
+            root.addView(actionButton("تعریف / تغییر تعرفه") { showFareConfigDialog(fare) })
+            root.addView(spacer(10))
+            root.addView(text("مصرف باتری", 17f, true))
+            root.addView(text("صفحه فقط در حالت نمایش، هر ۵ ثانیه به‌روز می‌شود. ثبت GPS در سرویس جداگانه ادامه دارد؛ خاموش شدن صفحه، ثبت مسیر را متوقف نمی‌کند.", 13f, false))
+            root.addView(spacer(10))
+            root.addView(text("وضعیت GPS: ${latestPoint?.let { if (it.validity == "VALID") "آخرین نقطه معتبر" else "آخرین نقطه نامعتبر" } ?: "بدون داده"}", 13f, false))
+            root.addView(text("اگر موقعیت تازه نیست یا GPS قطع شده، کرایه نهایی نباید بدون بررسی مسیر تأیید شود.", 12f, false, 0xFF8A3B30.toInt()))
         } else {
-            recentTrips.forEach { trip ->
-                val historyCard = card()
-                val status = when {
-                    trip.status == "ACTIVE" -> "فعال"
-                    trip.fareStatus == "NEEDS_REVIEW" || trip.reviewStatus == "REQUIRED" -> "بسته‌شده · نیازمند بررسی"
-                    else -> "بسته‌شده"
+            root.addView(text("نمای کابین", 19f, true))
+            root.addView(text("وضعیت صندلی‌ها و برآورد کرایه هر مسافر مستقل است.", 12f, false, 0xFF5F6368.toInt()))
+            root.addView(spacer(5))
+
+            // Front row: driver and front passenger seat 1.
+            val frontRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                gravity = Gravity.CENTER
+            }
+            val driverCard = card().apply {
+                setBackgroundColor(0xFFE3EAF4.toInt())
+                addView(text("راننده", 16f, true, 0xFF214A78.toInt()))
+                addView(text(if (activeSession != null) "شیفت فعال" else "شیفت غیرفعال", 12f, false))
+                addView(text(if (gpsFresh) "GPS تازه" else "GPS بررسی شود", 12f, true, if (gpsFresh) 0xFF287D46.toInt() else 0xFF9A5B00.toInt()))
+                addView(text("${activeTrips.size}/4 مسافر", 12f, false))
+            }
+            driverCard.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(4) }
+            frontRow.addView(driverCard)
+            val frontPassenger = createSeatCard(1, activeTrips.firstOrNull { it.seatNumber == 1 }, activeSession != null)
+            frontPassenger.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(4) }
+            frontRow.addView(frontPassenger)
+            root.addView(frontRow)
+            root.addView(spacer(6))
+
+            // Rear bench: seats 2, 3 and 4.
+            val rearRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                layoutDirection = View.LAYOUT_DIRECTION_RTL
+                gravity = Gravity.CENTER
+            }
+            for (seat in 2..4) {
+                val seatView = createSeatCard(seat, activeTrips.firstOrNull { it.seatNumber == seat }, activeSession != null)
+                seatView.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (seat != 2) marginStart = dp(3)
+                    if (seat != 4) marginEnd = dp(3)
                 }
-                historyCard.addView(text("صندلی ${trip.seatNumber} · ${trip.id.take(8)}…", 14f, true))
-                historyCard.addView(text("$status · مسافت ثبت‌شده ${trip.distanceMeters} متر", 12f, false))
-                historyCard.addView(text("کرایه محاسبه‌شده: ${trip.calculatedFareToman?.let { money(it) } ?: "نامشخص"} · نهایی: ${trip.finalFareToman?.let { money(it) } ?: "در انتظار بررسی"}", 12f, false))
-                if (trip.status == "CLOSED" && trip.calculatedFareToman != null && trip.fareStatus == "FINAL") {
-                    historyCard.addView(actionButton("اصلاح کرایه با ثبت علت") { showFareAdjustmentDialog(trip) })
+                rearRow.addView(seatView)
+            }
+            root.addView(rearRow)
+            root.addView(spacer(12))
+
+            root.addView(text("سفرهای اخیر", 18f, true))
+            val recentTrips = allTrips.sortedByDescending { it.boardedAtMs }.take(8)
+            if (recentTrips.isEmpty()) {
+                root.addView(text("هنوز سفری در این شیفت ثبت نشده است.", 13f, false, 0xFF5F6368.toInt()))
+            } else {
+                recentTrips.forEach { trip ->
+                    val historyCard = card()
+                    val status = when {
+                        trip.status == "ACTIVE" -> "فعال"
+                        trip.fareStatus == "NEEDS_REVIEW" || trip.reviewStatus == "REQUIRED" -> "بسته‌شده · نیازمند بررسی"
+                        else -> "بسته‌شده"
+                    }
+                    historyCard.addView(text("صندلی ${trip.seatNumber} · ${trip.id.take(8)}…", 13f, true))
+                    historyCard.addView(text("$status · مسافت ${trip.distanceMeters} متر", 12f, false))
+                    historyCard.addView(text("برآورد ثبت‌شده: ${trip.calculatedFareToman?.let { money(it) } ?: "—"} · نهایی: ${trip.finalFareToman?.let { money(it) } ?: "در انتظار بررسی"}", 11f, false))
+                    if (trip.status == "CLOSED" && trip.calculatedFareToman != null && trip.fareStatus == "FINAL") {
+                        historyCard.addView(actionButton("اصلاح کرایه با ثبت علت") { showFareAdjustmentDialog(trip) })
+                    }
+                    root.addView(historyCard)
+                    root.addView(spacer(5))
                 }
-                root.addView(historyCard)
-                root.addView(spacer(6))
             }
         }
-        root.addView(spacer(12))
-        root.addView(text("نمونه اولیه است؛ پیش از استفاده واقعی باید روی گوشی و مسیرهای میدانی آزمون شود.", 12f, false, 0xFF8A3B30.toInt()))
+        root.addView(spacer(10))
+        root.addView(text("نمونه اولیه است؛ پیش از استفاده واقعی باید روی گوشی و مسیرهای میدانی آزمون شود.", 11f, false, 0xFF8A3B30.toInt()))
+        currentScrollView = scroll
         setContentView(scroll)
+        scroll.post { scroll.scrollTo(0, previousScrollY) }
+    }
+
+    private suspend fun createSeatCard(seat: Int, trip: PassengerTripEntity?, shiftActive: Boolean): LinearLayout {
+        val seatCard = card().apply { setPadding(dp(8), dp(8), dp(8), dp(8)) }
+        seatCard.addView(text("صندلی $seat", 14f, true))
+        if (trip == null) {
+            seatCard.setBackgroundColor(0xFFE8F5EC.toInt())
+            seatCard.addView(text("آزاد", 13f, true, 0xFF287D46.toInt()))
+            seatCard.addView(actionButton("سوار کردن") {
+                val session = currentSessionId
+                if (session == null) toast("ابتدا شیفت را شروع کنید.") else confirmBoardPassenger(session, seat)
+            }.apply { isEnabled = shiftActive && !actionInProgress })
+        } else {
+            val dao = db.taxiDao()
+            val distance = dao.getAllocatedDistanceMeters(trip.id)
+            val fareConfig = dao.getFareConfig(trip.fareConfigId)
+            val needsReview = trip.reviewStatus == "REQUIRED" || trip.hasUnresolvedGap || trip.distanceStatus == "GAP_DETECTED"
+            seatCard.setBackgroundColor(if (needsReview) 0xFFFFF0D8.toInt() else 0xFFE8EEF9.toInt())
+            seatCard.addView(text(if (needsReview) "نیازمند بررسی" else "مسافر سوار است", 12f, true,
+                if (needsReview) 0xFF9A5B00.toInt() else 0xFF2256A0.toInt()))
+            seatCard.addView(text("${distance} متر", 16f, true))
+            val estimate = fareConfig?.let { estimateFare(distance, it) }
+            seatCard.addView(text("برآورد: ${estimate?.let { money(it) } ?: "تعرفه نامشخص"}", 12f, true))
+            seatCard.addView(text(if (needsReview) "مسافت ثبت‌شده؛ مسیر ناقص/نامطمئن" else "کرایه هنوز قطعی نیست", 10f, false, 0xFF5F6368.toInt()))
+            seatCard.addView(actionButton("پیاده‌شدن") { confirmAlightPassenger(trip) }.apply { isEnabled = !actionInProgress })
+        }
+        return seatCard
+    }
+
+    private fun estimateFare(distanceMeters: Long, fare: FareConfigEntity): Long? {
+        return try {
+            val product = Math.multiplyExact(distanceMeters.coerceAtLeast(0L), fare.ratePerKmToman.coerceAtLeast(0L))
+            val rounded = Math.addExact(product, 500L) / 1000L
+            maxOf(fare.minimumFareToman.coerceAtLeast(0L), rounded)
+        } catch (_: ArithmeticException) {
+            null
+        }
     }
 
     private fun beginStartShiftFlow(activeFare: FareConfigEntity?) {
@@ -486,5 +606,8 @@ class MainActivity : ComponentActivity() {
         private const val ACTION_START_SHIFT = "START_SHIFT"
         private const val ACTION_RESUME_GPS = "RESUME_GPS"
         private const val GPS_FRESHNESS_MS = 15_000L
+        private const val UI_REFRESH_INTERVAL_MS = 5_000L
+        private const val TAB_CURRENT = 0
+        private const val TAB_MANAGEMENT = 1
     }
 }
