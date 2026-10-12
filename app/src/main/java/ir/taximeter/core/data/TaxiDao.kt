@@ -54,6 +54,10 @@ interface TaxiDao {
     @Query("SELECT * FROM passenger_trips WHERE sessionId = :sessionId ORDER BY boardedAtMs")
     suspend fun getTripsForSession(sessionId: Long): List<PassengerTripEntity>
 
+    /** Closed trips with GPS endpoints, used only as historical route references for uncertain trips. */
+    @Query("SELECT * FROM passenger_trips WHERE status = 'CLOSED' AND fareStatus = 'FINAL' AND distanceStatus = 'VERIFIED' AND hasUnresolvedGap = 0 AND distanceMethod = 'GPS' AND distanceMeters > 0 AND boardingLat IS NOT NULL AND boardingLon IS NOT NULL AND alightingLat IS NOT NULL AND alightingLon IS NOT NULL ORDER BY boardedAtMs DESC LIMIT 500")
+    suspend fun getHistoricalTripsWithEndpoints(): List<PassengerTripEntity>
+
     @Query("SELECT * FROM location_points WHERE sessionId = :sessionId ORDER BY recordedAtMs DESC, id DESC LIMIT 1")
     suspend fun getLatestLocationPoint(sessionId: Long): LocationPointEntity?
 
