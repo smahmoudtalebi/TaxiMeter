@@ -29,14 +29,21 @@ import ir.taximeter.core.data.FareAdjustmentResult
 import ir.taximeter.core.data.SessionCloseResult
 import ir.taximeter.core.location.LocationPermissionController
 import ir.taximeter.core.location.LocationTrackingService
+import ir.taximeter.core.payment.PosPaymentGateway
+import ir.taximeter.core.payment.PosPaymentRequest
+import ir.taximeter.core.payment.PosPaymentResult
+import ir.taximeter.core.payment.UnconfiguredBluetoothPosGateway
 import kotlinx.coroutines.launch
 import java.text.NumberFormat
 import java.util.Locale
+import java.util.UUID
 
 /** First integrated Persian driver screen. Native Android views are used to keep the prototype lightweight. */
 class MainActivity : ComponentActivity() {
     private val db by lazy { TaxiDatabase.getInstance(this) }
     private val repository by lazy { TaxiRepository(db) }
+    /** Replace with the vendor-specific adapter after the exact POS model/SDK is selected. */
+    private val posPaymentGateway: PosPaymentGateway by lazy { UnconfiguredBluetoothPosGateway() }
     private lateinit var locationPermissions: LocationPermissionController
     private var currentSessionId: Long? = null
     private var pendingLocationAction: String? = null
@@ -234,8 +241,18 @@ class MainActivity : ComponentActivity() {
                     historyCard.addView(text("صندلی ${trip.seatNumber} · ${trip.id.take(8)}…", 13f, true))
                     historyCard.addView(text("$status · مسافت ${trip.distanceMeters} متر", 12f, false))
                     historyCard.addView(text("برآورد ثبت‌شده: ${trip.calculatedFareToman?.let { money(it) } ?: "—"} · نهایی: ${trip.finalFareToman?.let { money(it) } ?: "در انتظار بررسی"}", 11f, false))
+                    if (trip.status == "CLOSED" && trip.fareStatus == "NEEDS_REVIEW") {
+                        historyCard.addView(actionButton("بررسی و تعیین کرایه") {
+                            lifecycleScope.launch {
+                                val config = db.taxiDao().getFareConfig(trip.fareConfigId)
+                                if (config == null) toast("تعرفه سفر پیدا نشد.")
+                                else showUncertainFareDialog(trip, trip.distanceMeters, config, null)
+                            }
+                        })
+                    }
                     if (trip.status == "CLOSED" && trip.calculatedFareToman != null && trip.fareStatus == "FINAL") {
                         historyCard.addView(actionButton("اصلاح کرایه با ثبت علت") { showFareAdjustmentDialog(trip) })
+                        historyCard.addView(actionButton("پرداخت / ارسال به پوز بلوتوثی") { showPaymentDialog(trip.finalFareToman ?: trip.calculatedFareToman ?: 0L, trip.id) })
                     }
                     root.addView(historyCard)
                     root.addView(spacer(5))
@@ -270,7 +287,7 @@ class MainActivity : ComponentActivity() {
             seatCard.addView(text("${distance} متر", 16f, true))
             val estimate = fareConfig?.let { estimateFare(distance, it) }
             seatCard.addView(text("برآورد: ${estimate?.let { money(it) } ?: "تعرفه نامشخص"}", 12f, true))
-            seatCard.addView(text(if (needsReview) "مسافت ثبت‌شده؛ مسیر ناقص/نامطمئن" else "کرایه هنوز قطعی نیست", 10f, false, 0xFF5F6368.toInt()))
+            seatCard.addView(text(if (needsReview) "مسافت ثبت‌شده؛ مسیر ناقص/نامطمئن" else "تعرفه روی مسافت GPS ثبت‌شده اعمال می‌شود", 10f, false, 0xFF5F6368.toInt()))
             seatCard.addView(actionButton("پیاده‌شدن") { confirmAlightPassenger(trip) }.apply { isEnabled = !actionInProgress })
         }
         return seatCard
@@ -447,9 +464,10 @@ class MainActivity : ComponentActivity() {
     private fun confirmAlightPassenger(trip: PassengerTripEntity) {
         AlertDialog.Builder(this)
             .setTitle("ثبت پیاده‌شدن")
-            .setMessage("سفر ${trip.id.take(8)}… بسته شود؟ اگر داده GPS ناقص باشد، کرایه قطعی اعلام نمی‌شود و سفر برای بررسی علامت می‌خورد.")
+            .setMessage("سفر ${trip.id.take(8)}… بسته شود؟ در صورت نقص GPS، ابتدا پیشنهاد مبتنی بر مسیرهای مشابه (اگر موجود باشد) یا فرمول دستی نمایش داده می‌شود؛ مبلغ را می‌توانید تغییر دهید.")
             .setNegativeButton("انصراف", null)
-            .setPositiveButton("ثبت پیاده‌شدن") { _, _ ->
+            .setPositiveButton("ثبت پیاده‌شدن و محاسبه کرایه") { _, _ ->
+                actionInProgress = true
                 lifecycleScope.launch {
                     try {
                         val dao = db.taxiDao()
@@ -460,6 +478,19 @@ class MainActivity : ComponentActivity() {
                         val invalidSegments = dao.countNonValidSegmentsInRange(trip.sessionId, trip.boardedAtMs, now)
                         val gap = trip.hasUnresolvedGap || trip.reviewStatus == "REQUIRED" || invalidSegments > 0 || !fresh
                         val complete = fresh && validSegments > 0 && invalidSegments == 0 && !gap
+                        val config = dao.getFareConfig(trip.fareConfigId)
+                        val endpointIsUsable = latest != null && now >= latest.recordedAtMs &&
+                            now - latest.recordedAtMs <= HISTORICAL_ENDPOINT_MAX_AGE_MS &&
+                            trip.boardingLat != null && trip.boardingLon != null &&
+                            distanceBetweenMeters(trip.boardingLat, trip.boardingLon, latest.latitude, latest.longitude) >= 100.0
+                        val historicalEstimate = if (!complete && endpointIsUsable && config != null) {
+                            historicalRouteFareEstimate(
+                                trip,
+                                latest!!.latitude,
+                                latest.longitude,
+                                config
+                            )
+                        } else null
                         val result = repository.alightPassenger(
                             tripId = trip.id,
                             nowMs = now,
@@ -469,16 +500,211 @@ class MainActivity : ComponentActivity() {
                             unresolvedGpsGap = gap
                         )
                         when (result) {
-                            is AlightPassengerResult.Finalized -> toast("سفر بسته شد. مسافت ${result.distanceMeters} متر · کرایه ${money(result.fareToman)}")
-                            is AlightPassengerResult.NeedsReview -> toast("سفر بسته شد؛ ${result.recordedDistanceMeters} متر ثبت شده اما کرایه نیازمند بررسی است.")
+                            is AlightPassengerResult.Finalized -> {
+                                toast("کرایه برآورد و نهایی شد: ${money(result.fareToman)}")
+                                showFareReadyDialog(result.fareToman, result.tripId)
+                            }
+                            is AlightPassengerResult.NeedsReview -> {
+                                if (config == null) {
+                                    toast("سفر بسته شد، اما تعرفه سفر پیدا نشد؛ اطلاعات باید بررسی شود.")
+                                } else {
+                                    showUncertainFareDialog(trip, result.recordedDistanceMeters, config, historicalEstimate)
+                                }
+                            }
                             is AlightPassengerResult.Failure -> toast(result.message)
                         }
                     } catch (error: Exception) {
                         toast("ثبت پیاده‌شدن ناموفق بود: ${error.message ?: "خطای نامشخص"}")
                     }
+                    actionInProgress = false
                     refreshScreen()
                 }
             }.show()
+    }
+
+    /** Looks for past trips with pickup and drop-off coordinates near this route. */
+    private suspend fun historicalRouteFareEstimate(
+        currentTrip: PassengerTripEntity,
+        endLat: Double,
+        endLon: Double,
+        config: FareConfigEntity
+    ): Long? {
+        val startLat = currentTrip.boardingLat ?: return null
+        val startLon = currentTrip.boardingLon ?: return null
+        val candidates = db.taxiDao().getHistoricalTripsWithEndpoints()
+            .asSequence()
+            .filter { it.id != currentTrip.id && it.boardedAtMs < currentTrip.boardedAtMs && it.distanceMeters > 0L }
+            .mapNotNull { old ->
+                val oldStartLat = old.boardingLat ?: return@mapNotNull null
+                val oldStartLon = old.boardingLon ?: return@mapNotNull null
+                val oldEndLat = old.alightingLat ?: return@mapNotNull null
+                val oldEndLon = old.alightingLon ?: return@mapNotNull null
+                val startDelta = distanceBetweenMeters(startLat, startLon, oldStartLat, oldStartLon)
+                val endDelta = distanceBetweenMeters(endLat, endLon, oldEndLat, oldEndLon)
+                if (startDelta <= HISTORICAL_ENDPOINT_RADIUS_M && endDelta <= HISTORICAL_ENDPOINT_RADIUS_M) {
+                    Triple(old.distanceMeters, startDelta + endDelta, old.boardedAtMs)
+                } else null
+            }
+            .sortedWith(compareBy<Triple<Long, Double, Long>> { it.second }.thenByDescending { it.third })
+            .take(3)
+            .toList()
+        if (candidates.isEmpty()) return null
+        val averageDistance = candidates.map { it.first }.average().toLong().coerceAtLeast(0L)
+        return estimateFare(averageDistance, config)
+    }
+
+    private fun distanceBetweenMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+        val earthRadius = 6_371_000.0
+        val dLat = Math.toRadians(lat2 - lat1)
+        val dLon = Math.toRadians(lon2 - lon1)
+        val a = kotlin.math.sin(dLat / 2) * kotlin.math.sin(dLat / 2) +
+            kotlin.math.cos(Math.toRadians(lat1)) * kotlin.math.cos(Math.toRadians(lat2)) *
+            kotlin.math.sin(dLon / 2) * kotlin.math.sin(dLon / 2)
+        return earthRadius * 2 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
+    }
+
+    private fun showUncertainFareDialog(
+        trip: PassengerTripEntity,
+        recordedDistanceMeters: Long,
+        config: FareConfigEntity,
+        historicalEstimate: Long?
+    ) {
+        val initialEstimate = historicalEstimate ?: config.minimumFareToman
+        val estimateInput = EditText(this).apply {
+            hint = "برآورد اولیه (تومان)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(initialEstimate.toString())
+        }
+        val manualUnitsInput = EditText(this).apply {
+            hint = "عدد دستی؛ هر واحد ۱۰۰۰ تومان"
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val finalInput = EditText(this).apply {
+            hint = "مبلغ نهایی برای دریافت (تومان)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(initialEstimate.toString())
+        }
+        val reasonInput = EditText(this).apply {
+            hint = "علت/توضیح راننده (الزامی)"
+            setText(if (historicalEstimate != null) "تخمین از مسیر مشابه گذشته؛ بازبینی راننده" else "نقص GPS؛ تخمین دستی راننده")
+        }
+        var estimateMethod = if (historicalEstimate != null) "HISTORICAL_ROUTE" else "MANUAL_ESTIMATE"
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(text("مسافت ثبت‌شده: $recordedDistanceMeters متر؛ به علت نقص GPS قطعی نیست.", 13f, true))
+            addView(text(if (historicalEstimate != null) "پیشنهاد از میان حداکثر ۳ سفر گذشته با مبدأ و مقصد نزدیک محاسبه شده است؛ راننده باید تأیید یا اصلاح کند." else "مسیر مشابهی با مختصات کافی پیدا نشد. از فرمول دستی استفاده کنید یا مبلغ برآورد را مستقیماً وارد کنید.", 12f, false))
+            addView(text("کرایه پایه مورد استفاده در فرمول دستی: ${money(config.minimumFareToman)}", 12f, false))
+            addView(estimateInput)
+            addView(manualUnitsInput)
+            addView(actionButton("محاسبه دستی: کرایه پایه + عدد × ۱۰۰۰") {
+                val units = parseLong(manualUnitsInput.text.toString())
+                if (units == null || units < 0L) {
+                    toast("عدد دستی باید صفر یا مثبت باشد.")
+                } else {
+                    try {
+                        val increment = Math.multiplyExact(units, 1000L)
+                        val total = Math.addExact(config.minimumFareToman, increment)
+                        estimateInput.setText(total.toString())
+                        finalInput.setText(total.toString())
+                        estimateMethod = "MANUAL_UNITS_1000"
+                    } catch (_: ArithmeticException) {
+                        toast("عدد واردشده بیش از حد بزرگ است.")
+                    }
+                }
+            })
+            addView(finalInput)
+            addView(reasonInput)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("تعیین کرایه با GPS نامطمئن")
+            .setView(box)
+            .setNegativeButton("بعداً بررسی می‌کنم", null)
+            .setPositiveButton("ثبت مبلغ و ادامه پرداخت", null)
+            .create().also { dialog ->
+                dialog.setOnShowListener {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        val estimate = parseLong(estimateInput.text.toString())
+                        val finalAmount = parseLong(finalInput.text.toString())
+                        val reason = reasonInput.text.toString().trim()
+                        if (estimate == null || finalAmount == null || estimate < 0L || finalAmount < 0L || reason.isBlank()) {
+                            toast("برآورد، مبلغ نهایی و علت معتبر را وارد کنید.")
+                            return@setOnClickListener
+                        }
+                        lifecycleScope.launch {
+                            when (val save = repository.resolveReviewedFare(
+                                tripId = trip.id,
+                                estimateToman = estimate,
+                                finalFareToman = finalAmount,
+                                method = estimateMethod,
+                                reason = reason,
+                                nowMs = System.currentTimeMillis()
+                            )) {
+                                is FareAdjustmentResult.Success -> {
+                                    dialog.dismiss()
+                                    toast("کرایه ثبت شد: ${money(finalAmount)}؛ برآورد اولیه ${money(save.originalCalculatedFareToman)} حفظ شد.")
+                                    showFareReadyDialog(finalAmount, trip.id)
+                                    refreshScreen()
+                                }
+                                is FareAdjustmentResult.Failure -> toast(save.message)
+                            }
+                        }
+                    }
+                }
+                dialog.show()
+            }
+    }
+
+    private fun showFareReadyDialog(amountToman: Long, tripId: String? = null) {
+        AlertDialog.Builder(this)
+            .setTitle("مبلغ قابل دریافت")
+            .setMessage("مبلغ کرایه: ${money(amountToman)} تومان\nاین مبلغ آماده پرداخت است. تأیید دریافت وجه فقط پس از پاسخ معتبر پوز ممکن خواهد بود.")
+            .setNegativeButton("بستن", null)
+            .setPositiveButton("پرداخت / ارسال به پوز") { _, _ -> showPaymentDialog(amountToman, tripId) }
+            .show()
+    }
+
+    /**
+     * Uses the vendor-neutral payment boundary. With the default adapter this safely reports
+     * that no POS is configured; it never falsely marks the fare as paid.
+     */
+    private fun showPaymentDialog(amountToman: Long, tripId: String? = null) {
+        if (amountToman <= 0L) {
+            toast("مبلغ پرداخت باید بیشتر از صفر باشد.")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("پرداخت با پوز بلوتوثی")
+            .setMessage("مبلغ: ${money(amountToman)} تومان\nبا ادامه، برنامه تلاش می‌کند درخواست را از طریق درگاه پرداخت تنظیم‌شده ارسال کند. در نسخه فعلی، درگاه دستگاه هنوز پیکربندی نشده و پرداخت واقعی انجام نخواهد شد.")
+            .setNegativeButton("انصراف", null)
+            .setPositiveButton("ارسال درخواست پرداخت") { _, _ ->
+                lifecycleScope.launch {
+                    val request = PosPaymentRequest(
+                        requestId = UUID.randomUUID().toString(),
+                        tripId = tripId,
+                        amountToman = amountToman
+                    )
+                    when (val result = posPaymentGateway.charge(request)) {
+                        is PosPaymentResult.Approved -> {
+                            val reference = result.terminalReference?.let { "\nشماره پیگیری پوز: $it" }.orEmpty()
+                            AlertDialog.Builder(this@MainActivity)
+                                .setTitle("پرداخت تأیید شد")
+                                .setMessage("پوز پرداخت را تأیید کرده است.$reference")
+                                .setPositiveButton("تأیید", null)
+                                .show()
+                        }
+                        is PosPaymentResult.Declined -> toast("پرداخت رد شد: ${result.message}")
+                        is PosPaymentResult.Failed -> toast("خطا در پرداخت: ${result.message}")
+                        is PosPaymentResult.NotConfigured -> AlertDialog.Builder(this@MainActivity)
+                            .setTitle("پوز هنوز پیکربندی نشده است")
+                            .setMessage(result.message + "\nبرای فعال‌سازی واقعی، مدل دقیق پوز و SDK/پروتکل رسمی آن لازم است.")
+                            .setPositiveButton("متوجه شدم", null)
+                            .show()
+                    }
+                }
+            }
+            .show()
     }
 
     private fun showFareAdjustmentDialog(trip: PassengerTripEntity) {
@@ -606,7 +832,9 @@ class MainActivity : ComponentActivity() {
         private const val ACTION_START_SHIFT = "START_SHIFT"
         private const val ACTION_RESUME_GPS = "RESUME_GPS"
         private const val GPS_FRESHNESS_MS = 15_000L
-        private const val UI_REFRESH_INTERVAL_MS = 5_000L
+        private const val HISTORICAL_ENDPOINT_MAX_AGE_MS = 5 * 60_000L
+        private const val HISTORICAL_ENDPOINT_RADIUS_M = 300.0
+        private const val UI_REFRESH_INTERVAL_MS = 1_000L
         private const val TAB_CURRENT = 0
         private const val TAB_MANAGEMENT = 1
     }
